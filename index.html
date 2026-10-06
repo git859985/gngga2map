@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>GNSS 即時軌跡</title>
+  <title>GNSS 即時軌跡監控 (RMC + GGA + GST)</title>
   
   <!-- Leaflet CSS -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
@@ -21,18 +21,17 @@
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     }
     
-    /* 懸浮資訊面板 */
     .status-panel {
       position: absolute;
       top: 12px;
       left: 12px;
       z-index: 1000;
-      background: rgba(255, 255, 255, 0.95);
+      background: rgba(255, 255, 255, 0.96);
       padding: 12px 14px;
       border-radius: 8px;
-      box-shadow: 0 4px 15px rgba(0,0,0,0.25);
+      box-shadow: 0 4px 18px rgba(0,0,0,0.25);
       width: calc(100% - 24px);
-      max-width: 320px;
+      max-width: 340px;
       backdrop-filter: blur(5px);
     }
     
@@ -45,25 +44,37 @@
     .panel-header h3 {
       font-size: 15px;
       font-weight: 600;
-      color: #222;
+      color: #111;
     }
-    .clear-btn {
-      background: #dc3545;
-      color: #fff;
+    .btn-group {
+      display: flex;
+      gap: 6px;
+    }
+    .panel-btn {
       border: none;
       font-size: 12px;
-      padding: 4px 10px;
+      padding: 4px 8px;
       border-radius: 4px;
       cursor: pointer;
       font-weight: 500;
+      color: #fff;
+    }
+    .clear-btn {
+      background: #dc3545;
     }
     .clear-btn:hover {
       background: #c82333;
     }
+    .center-btn {
+      background: #6c757d;
+    }
+    .center-btn.active {
+      background: #198754;
+    }
     
     .status-content {
       font-size: 13px;
-      color: #333;
+      color: #222;
       line-height: 1.6;
     }
     .status-badge {
@@ -81,12 +92,27 @@
       font-size: 12px;
       color: #111;
     }
+    .gst-highlight {
+      color: #d63384;
+      font-weight: 600;
+    }
+    .motion-highlight {
+      color: #0d6efd;
+      font-weight: 600;
+    }
     .sub-info {
       font-size: 11px;
       color: #666;
-      margin-top: 4px;
+      margin-top: 5px;
       border-top: 1px solid #eee;
       padding-top: 4px;
+    }
+    
+    .heading-icon {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      pointer-events: none;
     }
   </style>
 </head>
@@ -97,21 +123,24 @@
   <div class="status-panel">
     <div class="panel-header">
       <h3>GNSS 航跡監控</h3>
-      <button class="clear-btn" id="btnClear">清除航跡</button>
+      <div class="btn-group">
+        <button class="panel-btn center-btn active" id="btnRecenter">鎖定跟隨</button>
+        <button class="panel-btn clear-btn" id="btnClear">清除航跡</button>
+      </div>
     </div>
     
     <div class="status-content">
       <div>解算：<span class="status-badge" id="fixBadge">連線中...</span></div>
       <div>座標：<span class="mono" id="posText">尚未取得</span></div>
       <div>數據：<span class="mono" id="satAltText">-</span></div>
+      <div>航行：<span class="mono motion-highlight" id="motionText">速度: - | 航向: -</span></div>
+      <div>精度 (GST)：<span class="mono gst-highlight" id="gstText">等待 GST...</span></div>
       <div>點數 / 航程：<span class="mono" id="trackStats">0 點 / 0.0 m</span></div>
-      <div class="sub-info" id="updateText">等待 NMEA 資料中...</div>
+      <div class="sub-info" id="updateText">等待 NMEA 封包...</div>
     </div>
   </div>
 
-  <!-- Leaflet JS -->
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <!-- MQTT.js CDN -->
   <script src="https://unpkg.com/mqtt@5.3.4/dist/mqtt.min.js"></script>
 
   <script>
@@ -125,7 +154,7 @@
       password: ''
     };
 
-    const TRACK_COLOR = '#FF0000'; // 一律使用純紅色
+    const TRACK_COLOR = '#FF0000'; // 一律純紅軌跡
 
     // ==========================================
     // 1. 初始化 Leaflet 地圖
@@ -133,9 +162,8 @@
     const map = L.map('map', {
       zoomControl: false,
       attributionControl: false
-    }).setView([22.61, 120.28], 15);
+    }).setView([23.9469, 120.6615], 17);
 
-    // Google 地圖圖層
     const googleRoadmap = L.tileLayer('https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}', { maxZoom: 22 });
     const googleSatellite = L.tileLayer('https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', { maxZoom: 22 });
     const osmMap = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 });
@@ -151,29 +179,52 @@
     L.control.zoom({ position: 'bottomright' }).addTo(map);
 
     // ==========================================
-    // 2. 狀態定義與標記管理
+    // 2. 標記、航向與跟隨控制
     // ==========================================
     const fixModes = {
       0: { text: "未定位", color: "#6c757d" },
-      1: { text: "單點 (Single)", color: "#FF0000" },
-      2: { text: "差分 (DGPS)", color: "#FF0000" },
-      4: { text: "RTK 固定解 (Fixed)", color: "#FF0000" },
-      5: { text: "RTK 浮點解 (Float)", color: "#FF0000" },
-      6: { text: "航位推算", color: "#FF0000" }
+      1: { text: "單點 (Single)", color: "#007bff" },
+      2: { text: "差分 (DGPS)", color: "#17a2b8" },
+      4: { text: "RTK 固定解 (Fixed)", color: "#28a745" },
+      5: { text: "RTK 浮點解 (Float)", color: "#fd7e14" },
+      6: { text: "航位推算", color: "#6f42c1" }
     };
 
     const trackLayerGroup = L.layerGroup().addTo(map);
     
     let currentMarker = null;
+    let headingMarker = null;
     let startMarker = null;
     let lastPoint = null;
+    let currentHeading = null;
     let totalPoints = 0;
     let totalDistance = 0;
-    let autoCenter = true;
+    let autoCenter = true; // 跟隨狀態開關
 
-    map.on('dragstart', () => { autoCenter = false; });
+    const btnRecenter = document.getElementById('btnRecenter');
 
-    // 大圓航線距離計算 (公尺)
+    function updateFollowState(state) {
+      autoCenter = state;
+      if (autoCenter) {
+        btnRecenter.classList.add('active');
+        btnRecenter.innerText = "鎖定跟隨";
+        if (lastPoint) {
+          map.panTo([lastPoint.lat, lastPoint.lng], { animate: true });
+        }
+      } else {
+        btnRecenter.classList.remove('active');
+        btnRecenter.innerText = "自由瀏覽";
+      }
+    }
+
+    // 當手動拖曳地圖或滾輪放大縮小時，立即停止強制置中
+    map.on('dragstart', () => { updateFollowState(false); });
+    map.on('zoomstart', () => { updateFollowState(false); });
+
+    btnRecenter.addEventListener('click', () => {
+      updateFollowState(!autoCenter);
+    });
+
     function calcDistance(lat1, lon1, lat2, lon2) {
       const R = 6371000;
       const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -185,15 +236,28 @@
       return R * c;
     }
 
+    function createHeadingIcon(degree) {
+      const svg = `
+        <svg viewBox="0 0 32 32" width="28" height="28" style="transform: rotate(${degree}deg); transform-origin: center center;">
+          <polygon points="16,2 26,28 16,21 6,28" fill="#FF0000" stroke="#FFFFFF" stroke-width="2" stroke-linejoin="round"/>
+        </svg>
+      `;
+      return L.divIcon({
+        className: 'heading-icon',
+        html: svg,
+        iconSize: [28, 28],
+        iconAnchor: [14, 14]
+      });
+    }
+
     function addTrackPoint(lat, lng, modeCode) {
-      const mode = fixModes[modeCode] || { text: `模式 ${modeCode}`, color: TRACK_COLOR };
       const currentLatLng = [lat, lng];
 
       if (lastPoint) {
         const segDist = calcDistance(lastPoint.lat, lastPoint.lng, lat, lng);
         totalDistance += segDist;
 
-        // 底層白色邊框 (寬度 8px)，加強反差
+        // 白色加粗底框 (8px)
         L.polyline([[lastPoint.lat, lastPoint.lng], currentLatLng], {
           color: '#ffffff',
           weight: 8,
@@ -202,7 +266,7 @@
           lineJoin: 'round'
         }).addTo(trackLayerGroup);
 
-        // 頂層主要航跡線 (純紅色，寬度 5px)
+        // 純紅色航跡 (5px)
         L.polyline([[lastPoint.lat, lastPoint.lng], currentLatLng], {
           color: TRACK_COLOR,
           weight: 5,
@@ -211,7 +275,6 @@
           lineJoin: 'round'
         }).addTo(trackLayerGroup);
       } else {
-        // 航跡起點標記
         startMarker = L.circleMarker(currentLatLng, {
           radius: 7,
           fillColor: "#ffffff",
@@ -222,10 +285,10 @@
         }).addTo(trackLayerGroup).bindPopup("航跡起點");
       }
 
-      // 即時船位/設備標記 (純紅色實心圓，白邊框)
+      // 當前位置純紅點
       if (!currentMarker) {
         currentMarker = L.circleMarker(currentLatLng, {
-          radius: 9,
+          radius: 6,
           fillColor: TRACK_COLOR,
           color: "#ffffff",
           weight: 2,
@@ -234,7 +297,19 @@
         }).addTo(map);
       } else {
         currentMarker.setLatLng(currentLatLng);
-        currentMarker.setStyle({ fillColor: TRACK_COLOR });
+      }
+
+      // 即時航向箭頭
+      if (currentHeading !== null) {
+        if (!headingMarker) {
+          headingMarker = L.marker(currentLatLng, {
+            icon: createHeadingIcon(currentHeading),
+            zIndexOffset: 1000
+          }).addTo(map);
+        } else {
+          headingMarker.setLatLng(currentLatLng);
+          headingMarker.setIcon(createHeadingIcon(currentHeading));
+        }
       }
 
       lastPoint = { lat, lng };
@@ -243,22 +318,39 @@
       const distStr = totalDistance > 1000 ? `${(totalDistance / 1000).toFixed(2)} km` : `${totalDistance.toFixed(1)} m`;
       document.getElementById('trackStats').innerText = `${totalPoints} 點 / ${distStr}`;
 
+      // 使用 panTo 平移中心點，絕不更動使用者手動調好的放大比例
       if (autoCenter) {
-        map.setView(currentLatLng, 18);
+        map.panTo(currentLatLng, { animate: true, duration: 0.5 });
       }
     }
 
     // ==========================================
-    // 3. NMEA GNGGA 解析
+    // 3. NMEA 解析器 (RMC / GGA / GST)
     // ==========================================
-    function parseGNGGA(sentence) {
-      const raw = sentence.trim();
-      if (!raw.includes('GGA')) return null;
+    function parseGNRMC(line) {
+      const match = line.match(/\$G[NPBLA]RMC,[^\*]*/);
+      if (!match) return null;
 
-      const ggaMatch = raw.match(/\$G[NPBLA]GGA,[^\*]*/);
-      if (!ggaMatch) return null;
+      const tokens = match[0].split(',');
+      if (tokens.length < 9) return null;
 
-      const tokens = ggaMatch[0].split(',');
+      const status = tokens[2];
+      const speedKnots = parseFloat(tokens[7]);
+      const headingTrue = parseFloat(tokens[8]);
+
+      return {
+        isValid: status === 'A',
+        speedKnots: isNaN(speedKnots) ? 0 : speedKnots,
+        speedKmh: isNaN(speedKnots) ? 0 : (speedKnots * 1.852),
+        heading: isNaN(headingTrue) ? null : headingTrue
+      };
+    }
+
+    function parseGNGGA(line) {
+      const match = line.match(/\$G[NPBLA]GGA,[^\*]*/);
+      if (!match) return null;
+
+      const tokens = match[0].split(',');
       if (tokens.length < 10) return null;
 
       const rawLat = tokens[2];
@@ -287,28 +379,54 @@
       return { lat, lng, fixQuality, satCount, hdop, altitude };
     }
 
+    function parseGNGST(line) {
+      const match = line.match(/\$G[NPBLA]GST,[^\*]*/);
+      if (!match) return null;
+
+      const tokens = match[0].split(',');
+      if (tokens.length < 9) return null;
+
+      const latStd = parseFloat(tokens[6]);
+      const lonStd = parseFloat(tokens[7]);
+      const altStd = parseFloat(tokens[8]);
+
+      if (isNaN(latStd) || isNaN(lonStd)) return null;
+
+      const hAcc = Math.sqrt(latStd * latStd + lonStd * lonStd);
+
+      return {
+        latStd: latStd,
+        lonStd: lonStd,
+        altStd: isNaN(altStd) ? null : altStd,
+        hAcc: hAcc
+      };
+    }
+
     // ==========================================
-    // 4. MQTT 連線
+    // 4. MQTT 批次多行處理
     // ==========================================
     const fixBadge = document.getElementById('fixBadge');
     const posText = document.getElementById('posText');
     const satAltText = document.getElementById('satAltText');
+    const motionText = document.getElementById('motionText');
+    const gstText = document.getElementById('gstText');
     const updateText = document.getElementById('updateText');
     const btnClear = document.getElementById('btnClear');
 
     btnClear.addEventListener('click', () => {
       trackLayerGroup.clearLayers();
-      if (currentMarker) {
-        map.removeLayer(currentMarker);
-        currentMarker = null;
-      }
+      if (currentMarker) { map.removeLayer(currentMarker); currentMarker = null; }
+      if (headingMarker) { map.removeLayer(headingMarker); headingMarker = null; }
       lastPoint = null;
+      currentHeading = null;
       totalPoints = 0;
       totalDistance = 0;
       document.getElementById('trackStats').innerText = "0 點 / 0.0 m";
       posText.innerText = "已清除";
       satAltText.innerText = "-";
-      autoCenter = true;
+      motionText.innerText = "速度: - | 航向: -";
+      gstText.innerText = "等待 GST...";
+      updateFollowState(true);
     });
 
     function startMQTT() {
@@ -335,19 +453,57 @@
       });
 
       client.on('message', (topic, payload) => {
-        const msgStr = payload.toString();
-        const data = parseGNGGA(msgStr);
+        const payloadStr = payload.toString();
+        const lines = payloadStr.split(/\r?\n/);
+        
+        let pendingGGA = null;
+        let pendingGST = null;
+        let pendingRMC = null;
 
-        if (data) {
-          const modeInfo = fixModes[data.fixQuality] || { text: `模式 ${data.fixQuality}`, color: TRACK_COLOR };
-          
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (!line) continue;
+
+          if (line.includes('RMC')) {
+            const parsed = parseGNRMC(line);
+            if (parsed) pendingRMC = parsed;
+          } else if (line.includes('GGA')) {
+            const parsed = parseGNGGA(line);
+            if (parsed) pendingGGA = parsed;
+          } else if (line.includes('GST')) {
+            const parsed = parseGNGST(line);
+            if (parsed) pendingGST = parsed;
+          }
+        }
+
+        // 1. 處理 RMC 速度與航向
+        if (pendingRMC) {
+          if (pendingRMC.heading !== null) {
+            currentHeading = pendingRMC.heading;
+          }
+          const knotStr = pendingRMC.speedKnots.toFixed(2);
+          const kmhStr = pendingRMC.speedKmh.toFixed(2);
+          const hdgStr = pendingRMC.heading !== null ? `${pendingRMC.heading.toFixed(1)}°` : '-';
+          motionText.innerText = `${kmhStr} km/h (${knotStr} kn) | 航向: ${hdgStr}`;
+        }
+
+        // 2. 處理 GST 精度
+        if (pendingGST) {
+          const hAccCm = (pendingGST.hAcc * 100).toFixed(1);
+          const vAccCm = pendingGST.altStd !== null ? (pendingGST.altStd * 100).toFixed(1) : '-';
+          gstText.innerText = `水平: ±${hAccCm} cm | 垂直: ±${vAccCm} cm`;
+        }
+
+        // 3. 處理 GGA 座標與劃記
+        if (pendingGGA) {
+          const modeInfo = fixModes[pendingGGA.fixQuality] || { text: `模式 ${pendingGGA.fixQuality}`, color: "#007bff" };
           fixBadge.innerText = modeInfo.text;
-          fixBadge.style.backgroundColor = (data.fixQuality === 4) ? "#28a745" : ((data.fixQuality === 5) ? "#fd7e14" : "#007bff");
-          posText.innerText = `${data.lat.toFixed(7)}, ${data.lng.toFixed(7)}`;
-          satAltText.innerText = `衛數: ${data.satCount} | 高程: ${data.altitude}m | HDOP: ${data.hdop}`;
-          updateText.innerText = `最後更新: ${new Date().toLocaleTimeString()}`;
+          fixBadge.style.backgroundColor = modeInfo.color;
+          posText.innerText = `${pendingGGA.lat.toFixed(8)}, ${pendingGGA.lng.toFixed(8)}`;
+          satAltText.innerText = `衛數: ${pendingGGA.satCount} | 高程: ${pendingGGA.altitude}m | HDOP: ${pendingGGA.hdop}`;
 
-          addTrackPoint(data.lat, data.lng, data.fixQuality);
+          addTrackPoint(pendingGGA.lat, pendingGGA.lng, pendingGGA.fixQuality);
+          updateText.innerText = `最後更新: ${new Date().toLocaleTimeString()}`;
         }
       });
 
