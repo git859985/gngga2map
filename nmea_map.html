@@ -538,7 +538,7 @@
       setStatus('已連線，正在訂閱…', 'warn');
       c.subscribe(topic, { qos: MQTT_QOS }, function (err) {
         if (err) setStatus('訂閱失敗：' + err.message, 'bad');
-        else setStatus('已訂閱 ' + topic, 'ok');
+        else setStatus('已連線', 'ok');
       });
     });
     c.on('reconnect', function () { if (!manualStop) setStatus('重新連線中…', 'warn'); });
