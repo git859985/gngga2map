@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>GNSS 即時軌跡監控 - /user/rock859985/RTK/log</title>
+  
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #map { width: 100%; height: 100%; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; }
+    .control-panel {
+      position: absolute; top: 10px; left: 10px; z-index: 1000;
+      background: rgba(255, 255, 255, 0.96); padding: 12px; border-radius: 8px;
+      box-shadow: 0 4px 15px rgba(0,0,0,0.15); width: calc(100% - 20px); max-width: 380px;
+      backdrop-filter: blur(5px);
+    }
+    .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .panel-header h3 { font-size: 15px; font-weight: 600; color: #333; }
+    .toggle-btn { background: none; border: none; font-size: 13px; color: #007bff; cursor: pointer; }
+    .panel-inputs { display: flex; flex-direction: column; gap: 6px; }
+    .panel-inputs input { width: 100%; padding: 6px 8px; font-size: 13px; border: 1px solid #ccc; border-radius: 4px; }
+    .auth-row { display: flex; gap: 6px; }
+    .action-row { display: flex; gap: 6px; margin-top: 4px; }
+    .action-row button { flex: 1; padding: 7px; font-size: 13px; font-weight: 500; border: none; border-radius: 4px; cursor: pointer; }
+    #btnConnect { background: #28a745; color: #fff; }
+    #btnConnect.connected { background: #dc3545; }
+    #btnClear { background: #6c757d; color: #fff; }
+    .status-card { margin-top: 8px; padding-top: 8px; border-top: 1px solid #eee; font-size: 12px; color: #444; line-height: 1.5; }
+    .status-badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-weight: 600; color: #fff; background: #6c757d; margin-bottom: 4px; }
+    .debug-msg { margin-top: 4px; font-size: 11px; color: #c82333; word-break: break-all; }
+    .collapsed .panel-inputs, .collapsed .action-row, .collapsed .debug-msg { display: none; }
+  </style>
+</head>
+<body>
+
+  <div id="map"></div>
+
+  <div class="control-panel" id="panel">
+    <div class="panel-header">
+      <h3>GNSS MQTT 監控</h3>
+      <button class="toggle-btn" id="btnToggle">收合</button>
+    </div>
+    
+    <div class="panel-inputs">
+      <input type="text" id="mqttHost" value="wss://mqttgo.vip:8084/mqtt" placeholder="MQTT WS 位址" />
+      <input type="text" id="mqttTopic" value="/user/rock859985/RTK/KY8688E/log" placeholder="訂閱 Topic" />
+      <div class="auth-row">
+        <input type="text" id="mqttUser" placeholder="帳號 (選填)" />
+        <input type="password" id="mqttPass" placeholder="密碼 (選填)" />
+      </div>
+    </div>
+    
+    <div class="action-row">
+      <button id="btnConnect">連線</button>
+      <button id="btnClear">清除軌跡</button>
+    </div>
+    
+    <div class="status-card">
+      <div>解算狀態：<span class="status-badge" id="fixBadge">待命中</span></div>
+      <div>座標：<span id="posText">尚未取得</span></div>
+      <div>衛星 / 高程：<span id="satAltText">-</span></div>
+      <div class="debug-msg" id="debugText"></div>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/mqtt@5.3.4/dist/mqtt.min.js"></script>
+
+  <script>
+    // 1. 地圖設定
+    const map = L.map('map', { zoomControl: false, attributionControl: false }).setView([23.97, 120.97], 7);
+    const googleRoadmap = L.tileLayer('https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}', { maxZoom: 21 });
+    const googleSatellite = L.tileLayer('https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}', { maxZoom: 21 });
+    const osmMap = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 });
+
+    googleRoadmap.addTo(map);
+    L.control.layers({ "Google 街道圖": googleRoadmap, "Google 混合衛星圖": googleSatellite, "OpenStreetMap": osmMap }, null, { position: 'bottomright' }).addTo(map);
+    L.control.zoom({ position: 'bottomright' }).addTo(map);
+
+    let polyline = L.polyline([], { color: '#007bff', weight: 4, opacity: 0.8 }).addTo(map);
+    let marker = null;
+    let autoCenter = true;
+
+    map.on('dragstart', () => { autoCenter = false; });
+
+    const fixModes = {
+      0: { text: "未定位 (Invalid)", color: "#6c757d" },
+      1: { text: "單點定位 (Single)", color: "#17a2b8" },
+      2: { text: "差分定位 (DGPS)", color: "#28a745" },
+      4: { text: "RTK 固定解 (Fixed)", color: "#00c853" },
+      5: { text: "RTK 浮點解 (Float)", color: "#ff9800" },
+      6: { text: "航位推算 (DR)", color: "#9c27b0" }
+    };
+
+    function updateMarker(lat, lng, modeCode) {
+      const mode = fixModes[modeCode] || { text: `模式 ${modeCode}`, color: "#333" };
+
+      if (!marker) {
+        marker = L.circleMarker([lat, lng], { radius: 8, fillColor: mode.color, color: "#fff", weight: 2, opacity: 1, fillOpacity: 0.9 }).addTo(map);
+      } else {
+        marker.setLatLng([lat, lng]);
+        marker.setStyle({ fillColor: mode.color });
+      }
+
+      polyline.addLatLng([lat, lng]);
+      if (autoCenter) map.setView([lat, lng], 18);
+    }
+
+    // 2. GNGGA 解析
+    function parseGNGGA(sentence) {
+      const raw = sentence.trim();
+      if (!raw.includes('GGA')) return null;
+
+      const ggaMatch = raw.match(/\$G[NPBLA]GGA,[^\*]*/);
+      if (!ggaMatch) return null;
+
+      const tokens = ggaMatch[0].split(',');
+      if (tokens.length < 10) return null;
+
+      const rawLat = tokens[2];
+      const latDir = tokens[3];
+      const rawLng = tokens[4];
+      const lngDir = tokens[5];
+      const fixQuality = parseInt(tokens[6], 10);
+      const satCount = tokens[7];
+      const hdop = tokens[8];
+      const altitude = tokens[9];
+
+      if (!rawLat || !rawLng || isNaN(fixQuality) || fixQuality === 0) return null;
+
+      const latDeg = parseFloat(rawLat.substring(0, 2));
+      const latMin = parseFloat(rawLat.substring(2));
+      let lat = latDeg + (latMin / 60.0);
+      if (latDir === 'S') lat = -lat;
+
+      const lngDeg = parseFloat(rawLng.substring(0, 3));
+      const lngMin = parseFloat(rawLng.substring(3));
+      let lng = lngDeg + (lngMin / 60.0);
+      if (lngDir === 'W') lng = -lng;
+
+      return { lat, lng, fixQuality, satCount, hdop, altitude };
+    }
+
+    // 3. 連線控制
+    let client = null;
+    const btnConnect = document.getElementById('btnConnect');
+    const btnClear = document.getElementById('btnClear');
+    const btnToggle = document.getElementById('btnToggle');
+    const panel = document.getElementById('panel');
+    const fixBadge = document.getElementById('fixBadge');
+    const posText = document.getElementById('posText');
+    const satAltText = document.getElementById('satAltText');
+    const debugText = document.getElementById('debugText');
+
+    const inputHost = document.getElementById('mqttHost');
+    const inputTopic = document.getElementById('mqttTopic');
+    const inputUser = document.getElementById('mqttUser');
+    const inputPass = document.getElementById('mqttPass');
+
+    if (localStorage.getItem('gnss_mqtt_host')) inputHost.value = localStorage.getItem('gnss_mqtt_host');
+    if (localStorage.getItem('gnss_mqtt_topic')) inputTopic.value = localStorage.getItem('gnss_mqtt_topic');
+    if (localStorage.getItem('gnss_mqtt_user')) inputUser.value = localStorage.getItem('gnss_mqtt_user');
+
+    btnToggle.addEventListener('click', () => {
+      panel.classList.toggle('collapsed');
+      btnToggle.innerText = panel.classList.contains('collapsed') ? '展開' : '收合';
+    });
+
+    btnClear.addEventListener('click', () => {
+      polyline.setLatLngs([]);
+      if (marker) { map.removeLayer(marker); marker = null; }
+      posText.innerText = "已清除";
+      satAltText.innerText = "-";
+      debugText.innerText = "";
+      autoCenter = true;
+    });
+
+    function connectMQTT() {
+      if (client) {
+        try { client.end(true); } catch(e){}
+        client = null;
+      }
+
+      const host = inputHost.value.trim();
+      const topic = inputTopic.value.trim();
+      const username = inputUser.value.trim();
+      const password = inputPass.value.trim();
+
+      if (!host || !topic) {
+        alert("請輸入 Broker WS 位址與 Topic");
+        return;
+      }
+
+      localStorage.setItem('gnss_mqtt_host', host);
+      localStorage.setItem('gnss_mqtt_topic', topic);
+      localStorage.setItem('gnss_mqtt_user', username);
+
+      btnConnect.innerText = "連線中...";
+      btnConnect.classList.remove('connected');
+      fixBadge.innerText = "連線中...";
+      fixBadge.style.backgroundColor = "#ffc107";
+      debugText.innerText = `嘗試連線: ${host}`;
+
+      const options = {
+        clientId: 'web_' + Math.random().toString(16).substring(2, 10),
+        clean: true,
+        connectTimeout: 8000,
+        reconnectPeriod: 4000
+      };
+
+      if (username) options.username = username;
+      if (password) options.password = password;
+
+      try {
+        client = mqtt.connect(host, options);
+
+        client.on('connect', () => {
+          btnConnect.innerText = "中斷連線";
+          btnConnect.classList.add('connected');
+          fixBadge.innerText = "已連線，待命中";
+          fixBadge.style.backgroundColor = "#17a2b8";
+          debugText.innerText = `已訂閱: ${topic}`;
+          client.subscribe(topic, (err) => {
+            if (err) debugText.innerText = "訂閱失敗: " + err.message;
+          });
+        });
+
+        client.on('message', (t, payload) => {
+          const msgStr = payload.toString();
+          const data = parseGNGGA(msgStr);
+
+          if (data) {
+            const modeInfo = fixModes[data.fixQuality] || { text: `模式 ${data.fixQuality}`, color: "#333" };
+            fixBadge.innerText = modeInfo.text;
+            fixBadge.style.backgroundColor = modeInfo.color;
+            posText.innerText = `${data.lat.toFixed(7)}, ${data.lng.toFixed(7)}`;
+            satAltText.innerText = `衛數: ${data.satCount} | 高程: ${data.altitude}m | HDOP: ${data.hdop}`;
+            debugText.innerText = `最後接收: ${new Date().toLocaleTimeString()}`;
+
+            updateMarker(data.lat, data.lng, data.fixQuality);
+          } else {
+            debugText.innerText = "已收訊號，但非 GGA 格式或尚未解算有效座標";
+          }
+        });
+
+        client.on('error', (err) => {
+          fixBadge.innerText = "連線失敗";
+          fixBadge.style.backgroundColor = "#dc3545";
+          debugText.innerText = `錯誤: ${err.message || '握手遭拒。請檢查憑證或路徑。'}`;
+        });
+
+        client.on('close', () => {
+          btnConnect.innerText = "連線";
+          btnConnect.classList.remove('connected');
+          fixBadge.innerText = "中斷/重試中";
+          fixBadge.style.backgroundColor = "#6c757d";
+        });
+      } catch (err) {
+        debugText.innerText = "初始化例外: " + err.message;
+      }
+    }
+
+    btnConnect.addEventListener('click', () => {
+      if (client && client.connected) {
+        client.end(true);
+        client = null;
+        btnConnect.innerText = "連線";
+        btnConnect.classList.remove('connected');
+        fixBadge.innerText = "已手動斷線";
+        fixBadge.style.backgroundColor = "#6c757d";
+        debugText.innerText = "";
+      } else {
+        connectMQTT();
+      }
+    });
+
+    window.addEventListener('DOMContentLoaded', () => {
+      connectMQTT();
+    });
+  </script>
+</body>
+</html>
