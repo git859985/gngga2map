@@ -67,11 +67,6 @@
   dt { color: var(--muted); font-size: 14px; }
   dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; font-family: Consolas, "Cascadia Mono", monospace; font-size: 14px; word-break: break-all; }
   .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: baseline; border: 1px solid rgba(0,0,0,.25); }
-  #rawlog {
-    margin: 0; max-height: 260px; overflow: auto; background: #111; color: #4dff4d; padding: 8px;
-    border-radius: 6px; font: 12px/1.4 Consolas, "Cascadia Mono", monospace; white-space: pre-wrap; word-break: break-all;
-  }
-  .legend { background: var(--card); color: var(--text); padding: 6px 10px; border-radius: 6px; border: 1px solid var(--line); font-size: 13px; line-height: 1.7; }
   @media (max-width: 860px) {
     body { min-height: 0; }
     main { grid-template-columns: 1fr; display: block; }
@@ -131,6 +126,19 @@
     </section>
 
     <section class="card">
+      <h2>誤差估計 <small>GST（單位：公尺）</small></h2>
+      <dl>
+        <dt>測距 RMS</dt><dd id="gst_rms">—</dd>
+        <dt>誤差橢圓長軸</dt><dd id="gst_major">—</dd>
+        <dt>誤差橢圓短軸</dt><dd id="gst_minor">—</dd>
+        <dt>橢圓長軸方向</dt><dd id="gst_orient">—</dd>
+        <dt>緯度標準差</dt><dd id="gst_lat">—</dd>
+        <dt>經度標準差</dt><dd id="gst_lon">—</dd>
+        <dt>高度標準差</dt><dd id="gst_alt">—</dd>
+      </dl>
+    </section>
+
+    <section class="card">
       <h2>速度與方向 <small>RMC</small></h2>
       <dl>
         <dt>狀態</dt><dd id="rmc_status">—</dd>
@@ -145,19 +153,6 @@
     </section>
 
     <section class="card">
-      <h2>誤差估計 <small>GST（單位：公尺）</small></h2>
-      <dl>
-        <dt>測距 RMS</dt><dd id="gst_rms">—</dd>
-        <dt>誤差橢圓長軸</dt><dd id="gst_major">—</dd>
-        <dt>誤差橢圓短軸</dt><dd id="gst_minor">—</dd>
-        <dt>橢圓長軸方向</dt><dd id="gst_orient">—</dd>
-        <dt>緯度標準差</dt><dd id="gst_lat">—</dd>
-        <dt>經度標準差</dt><dd id="gst_lon">—</dd>
-        <dt>高度標準差</dt><dd id="gst_alt">—</dd>
-      </dl>
-    </section>
-
-    <section class="card">
       <h2>統計</h2>
       <dl>
         <dt>已收到的行數</dt><dd id="st_total">0</dd>
@@ -165,11 +160,6 @@
         <dt>已忽略（格式或檢查碼錯誤）</dt><dd id="st_bad">0</dd>
         <dt>軌跡點數</dt><dd id="st_trail">0</dd>
       </dl>
-    </section>
-
-    <section class="card">
-      <h2>原始訊息 <small>✓ 有效　✗ 已忽略</small></h2>
-      <pre id="rawlog" tabindex="0" aria-label="原始訊息"></pre>
     </section>
   </aside>
 </main>
@@ -188,9 +178,9 @@
   const DEFAULT_DEVICE_ID = 'KY123456';
 
   const MAX_TRAIL_POINTS = 5000;         // 軌跡最多保留幾個點，超過就丟掉最舊的
+  const TRAIL_COLOR = '#dc2626';          // 軌跡顏色（紅色）
   const MIN_STEP_METERS = 0.02;          // 與上一點相距小於這個距離就不加點（靜止時避免堆積）
   const STALE_SECONDS = 5;               // 超過幾秒沒收到新定位，就標示「資料中斷」
-  const RAWLOG_LINES = 60;               // 原始訊息區保留的行數
   /* ======================================== */
 
   const LIB_URLS = {
@@ -224,7 +214,7 @@
     btnFit: $('btnFit'), btnClear: $('btnClear'),
     statusChip: $('statusChip'), staleChip: $('staleChip'),
     notice: $('notice'), fileNotice: $('fileNotice'), btnFileNoticeClose: $('btnFileNoticeClose'),
-    rawlog: $('rawlog'), topicHint: $('topicHint')
+    topicHint: $('topicHint')
   };
 
   /* ---------- 小工具 ---------- */
@@ -284,15 +274,8 @@
     setText('st_trail', trailCount);
   }
 
-  /* ---------- 原始訊息區（用 textContent，避免把收到的內容當 HTML 執行） ---------- */
-  const rawLines = [];
-  function pushRaw(mark, text, note) {
-    const shown = text.length > 200 ? text.slice(0, 200) + '…' : text;
-    rawLines.push(mark + ' ' + shown + (note ? '   ← ' + note : ''));
-    if (rawLines.length > RAWLOG_LINES) rawLines.shift();
-    el.rawlog.textContent = rawLines.join('\n');
-    el.rawlog.scrollTop = el.rawlog.scrollHeight;
-  }
+  /* 原始訊息區已移除；保留此函式讓解析流程不用改 */
+  function pushRaw() {}
 
   /* ---------- NMEA 解析 ---------- */
   const SENTENCE_RE = /^\$([A-Z0-9]{3,12}),([^*]*)\*([0-9A-Fa-f]{2})/;
@@ -429,7 +412,7 @@
 
   /* ---------- 地圖與軌跡 ---------- */
   let map = null, mapReady = false, marker = null;
-  const segments = [];     // 每段軌跡 { q, line, last }：品質改變就換一段，用不同顏色
+  const segments = [];     // 軌跡線段 { q, line, last }（目前整條軌跡只有一段、統一紅色）
   let trailCount = 0;
 
   function qualityColor(q) { return QUALITY[q] ? QUALITY[q].color : OTHER_COLOR; }
@@ -454,11 +437,10 @@
     }
 
     const last = segments[segments.length - 1];
-    if (last && distMeters(last.last, ll) < MIN_STEP_METERS && last.q === q) return;
+    if (last && distMeters(last.last, ll) < MIN_STEP_METERS) return;
 
-    if (!last || last.q !== q) {
-      const pts = last ? [last.last, ll] : [ll];
-      const line = L.polyline(pts, { color: color, weight: 4, opacity: 0.9 }).addTo(map);
+    if (!last) {
+      const line = L.polyline([ll], { color: TRAIL_COLOR, weight: 4, opacity: 0.9 }).addTo(map);
       segments.push({ q: q, line: line, last: ll });
     } else {
       last.line.addLatLng(ll);
@@ -506,20 +488,6 @@
       maxZoom: 19, attribution: 'Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community'
     });
     L.control.layers({ '街道圖 (OpenStreetMap)': osm, '衛星影像 (Esri)': esri }).addTo(map);
-
-    const legend = L.control({ position: 'bottomleft' });
-    legend.onAdd = function () {
-      const div = L.DomUtil.create('div', 'legend');
-      [[4, 'RTK 固定解'], [5, 'RTK 浮動解'], [2, '差分定位'], [1, '單點定位']].forEach(function (it) {
-        const row = document.createElement('div');
-        const dot = document.createElement('span');
-        dot.className = 'dot'; dot.style.background = qualityColor(it[0]);
-        row.appendChild(dot); row.appendChild(document.createTextNode(it[1]));
-        div.appendChild(row);
-      });
-      return div;
-    };
-    legend.addTo(map);
 
     map.on('dragstart', function () { el.chkFollow.checked = false; });   // 手動拖曳地圖就停止自動置中
     mapReady = true;
